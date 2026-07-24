@@ -20,6 +20,7 @@ Config comes from env (no secrets in code):
 """
 import asyncio
 import os
+import re
 from pathlib import Path
 
 from telegram import Update
@@ -105,6 +106,21 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
     reply = await run_qwen(prompt)
+    # Auto-attach images: when qwen's reply cites absolute image paths that
+    # exist on disk (e.g. something it just generated), send them as photos —
+    # a path string is useless on a phone (Zach 2026-07-24: "why can't the
+    # qwen code send back the generated image"). Max 3; text still follows.
+    try:
+        img_paths = []
+        for m in re.finditer(r"(/[A-Za-z0-9_.@/-]+\.(?:png|jpe?g|webp))\b", reply):
+            p = m.group(1)
+            if os.path.exists(p) and os.path.getsize(p) < 49_000_000 and p not in img_paths:
+                img_paths.append(p)
+        for p in img_paths[:3]:
+            with open(p, "rb") as fh:
+                await ctx.bot.send_photo(chat_id=chat_id, photo=fh)
+    except Exception:
+        pass  # photo attach is best-effort; the text reply below always goes
     # Render markdown (bold, code blocks) when it parses; fall back to plain text
     # so a stray * or _ never turns into a silent 400 from Telegram.
     try:
