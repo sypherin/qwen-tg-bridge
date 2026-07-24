@@ -28,6 +28,9 @@ from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filte
 TOKEN = os.environ["TG_QWEN_BOT_TOKEN"]
 ALLOWED = {int(c) for c in os.environ.get("QWEN_TG_ALLOWED_CHATS", "").split(",") if c.strip()}
 WORKDIR = Path(os.environ.get("QWEN_TG_WORKDIR", Path.home() / "qwen-tg-bridge" / "work"))
+# Headless runs use -y by design (allowlisted to Zach only); silence the YOLO
+# warning so it stops leaking into Telegram replies as stderr noise.
+os.environ.setdefault("QWEN_CODE_SUPPRESS_YOLO_WARNING", "1")
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8001/v1")
 MODEL = os.environ.get("OPENAI_MODEL", "qwen3.6-35b-a3b")
 RUN_TIMEOUT = int(os.environ.get("QWEN_TG_TIMEOUT", "600"))
@@ -39,7 +42,11 @@ async def _run(prompt: str, cont: bool) -> tuple[str, str]:
     env = {**os.environ, "OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "sk-local"), "OPENAI_MODEL": MODEL}
     # -c/--continue resumes the most recent session in WORKDIR, so context (and
     # qwen's built-in auto-compaction) carries across Telegram messages.
-    args = ["qwen", "-p", prompt, "-o", "text", "--approval-mode", "auto"]
+    # -y (YOLO): headless runs cannot answer approval prompts — without it,
+    # tool calls stall ("requires user approval but cannot execute in
+    # non-interactive mode", seen live 2026-07-24 on a photo message).
+    # Acceptable because the chat allowlist is Zach only.
+    args = ["qwen", "-p", prompt, "-o", "text", "-y"]
     if cont:
         args.insert(3, "-c")
     proc = await asyncio.create_subprocess_exec(
@@ -70,7 +77,30 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
         return  # silent: do not engage non-allowlisted chats
-    prompt = (update.message.text or "").strip()
+    prompt = (update.message.text or update.message.caption or "").strip()
+    # Photos: qwen's brain (:8001) is text-only, so hand the agent a file path
+    # plus the `see` CLI (Qwen3-VL on :8080) as its eyes. Largest size wins.
+    if update.message.photo:
+        try:
+            tgf = await update.message.photo[-1].get_file()
+            # .imgfile (NOT .jpg): qwen-code's CLI auto-attaches image-extension
+            # paths it spots in the prompt, force-feeding them to the text-only
+            # :8001 backend -> "500 image input is not supported" (seen live
+            # twice, 2026-07-24). A non-image extension defeats the sniffer;
+            # the `see` CLI decodes actual bytes so the extension is irrelevant.
+            img_path = WORKDIR / f"tg-photo-{update.message.message_id}.imgfile"
+            await tgf.download_to_drive(str(img_path))
+            prompt = (
+                f"The user sent an image, saved at {img_path}. IMPORTANT: your own model "
+                f"CANNOT accept image input (it 500s: 'image input is not supported'). Do "
+                f"NOT attach or embed the image into your context, and do NOT open it with "
+                f"browser/page tools. The ONLY way to view it is the shell command "
+                f"`~/bin/see {img_path}` (add a quoted question, or --ocr to transcribe "
+                f"text). Run that first, then answer the user."
+                + (f" User's caption: {prompt}" if prompt else " The user sent no caption; describe what the image shows and surface anything notable.")
+            )
+        except Exception as e:  # noqa: BLE001 — never drop a message silently
+            prompt = f"(The user sent an image but downloading it failed: {e}. Tell them to resend.)"
     if not prompt:
         return
     await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -87,7 +117,7 @@ def main():
     if not ALLOWED:
         raise SystemExit("Refusing to start: QWEN_TG_ALLOWED_CHATS is empty (would accept anyone).")
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, on_message))
     print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} workdir={WORKDIR}")
     app.run_polling()
 
