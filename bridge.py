@@ -21,10 +21,47 @@ Config comes from env (no secrets in code):
 import asyncio
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+
+JUDGE = Path.home() / "bin" / "judge"
+# The judgment model runs at 4096 ctx; a very long reply would push the system
+# prompt out and produce a garbage verdict. The head is where claims-of-done are.
+JUDGE_MAX_CHARS = 6000
+
+
+def judge_reply(reply: str, chat_id: int) -> None:
+    """Send an outbound reply to the local judgment gate. Fire and forget.
+
+    Observe-only: --advisory forces exit 0, the process is detached with its
+    output discarded, and every failure is swallowed. The user's reply has
+    already been sent by the time this runs, so it cannot delay or block
+    anything. A QC gate must never degrade the thing it observes.
+    """
+    try:
+        if not JUDGE.exists():
+            return
+        body = (reply or "").strip()
+        if len(body) < 40:          # trivial acks carry no judgeable claim
+            return
+        if len(body) > JUDGE_MAX_CHARS:
+            body = body[:JUDGE_MAX_CHARS] + " […truncated]"
+        situation = (
+            "[phase: post] Qwen Code is sending this reply to the user on "
+            f'telegram: "{body}"'
+        )
+        subprocess.Popen(
+            ["python3", str(JUDGE), "--caller", "qwen-code",
+             "--advisory", "--quiet", situation],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+            env={**os.environ, "JUDGE_SESSION": f"tg:{chat_id}"},
+        )
+    except Exception:
+        pass  # deliberately silent
 
 TOKEN = os.environ["TG_QWEN_BOT_TOKEN"]
 ALLOWED = {int(c) for c in os.environ.get("QWEN_TG_ALLOWED_CHATS", "").split(",") if c.strip()}
@@ -127,6 +164,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, parse_mode="Markdown")
     except Exception:
         await update.message.reply_text(reply)
+    # After the user has their reply, not before: this must never add latency.
+    judge_reply(reply, chat_id)
 
 
 def main():
