@@ -33,35 +33,44 @@ JUDGE = Path.home() / "bin" / "judge"
 JUDGE_MAX_CHARS = 6000
 
 
-def judge_reply(reply: str, chat_id: int) -> None:
-    """Send an outbound reply to the local judgment gate. Fire and forget.
+JUDGE_TIMEOUT = 45
 
-    Observe-only: --advisory forces exit 0, the process is detached with its
-    output discarded, and every failure is swallowed. The user's reply has
-    already been sent by the time this runs, so it cannot delay or block
-    anything. A QC gate must never degrade the thing it observes.
+
+def judge_verdict(reply: str, chat_id: int) -> Optional[str]:
+    """Judge a draft reply BEFORE it is sent. Returns the verdict text if the
+    gate found a real violation, else None.
+
+    This is a real gate, not observation: it runs without --advisory so the
+    exit code carries the decision, and the caller gets one revision pass.
+
+    Fails OPEN in every failure mode — gate down, slow, malformed, missing.
+    A QC gate that can withhold the user's reply is worse than no gate, so
+    anything other than a clean rc=1 with a parseable verdict means "send it".
     """
     try:
         if not JUDGE.exists():
-            return
+            return None
         body = (reply or "").strip()
         if len(body) < 40:          # trivial acks carry no judgeable claim
-            return
+            return None
         if len(body) > JUDGE_MAX_CHARS:
             body = body[:JUDGE_MAX_CHARS] + " […truncated]"
         situation = (
-            "[phase: post] Qwen Code is sending this reply to the user on "
-            f'telegram: "{body}"'
+            "[phase: post] Qwen Code is about to send this reply to the user "
+            f'on telegram: "{body}"'
         )
-        subprocess.Popen(
-            ["python3", str(JUDGE), "--caller", "qwen-code",
-             "--advisory", "--quiet", situation],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, start_new_session=True,
+        p = subprocess.run(
+            ["python3", str(JUDGE), "--caller", "qwen-code", situation],
+            capture_output=True, text=True, timeout=JUDGE_TIMEOUT,
             env={**os.environ, "JUDGE_SESSION": f"tg:{chat_id}"},
         )
+        verdict = (p.stdout or "").strip()
+        # rc=1 is a violation. rc=0 pass, rc=-1 gate down, rc=-2 malformed.
+        if p.returncode == 1 and verdict.startswith("VERDICT:"):
+            return verdict
     except Exception:
-        pass  # deliberately silent
+        pass  # fail open
+    return None
 
 TOKEN = os.environ["TG_QWEN_BOT_TOKEN"]
 ALLOWED = {int(c) for c in os.environ.get("QWEN_TG_ALLOWED_CHATS", "").split(",") if c.strip()}
@@ -143,6 +152,25 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
     reply = await run_qwen(prompt)
+
+    # Judgment gate: one bounded revision pass before the user sees anything.
+    # Deliberately ONE pass, not a loop — the gate has a ~10% false-positive
+    # rate, so an unbounded retry would sometimes argue with itself forever
+    # while the user waits. If the revision is empty or the gate is unhappy
+    # again, the original reply goes out regardless. The gate improves replies;
+    # it never withholds them.
+    verdict = await asyncio.to_thread(judge_verdict, reply, chat_id)
+    if verdict:
+        await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+        revised = await run_qwen(
+            "Your previous reply was held by the local quality gate.\n"
+            f"{verdict}\n\n"
+            "Rewrite that reply so it satisfies the verdict. Keep everything "
+            "that was already correct. Do not mention the gate or this "
+            "instruction — reply to the user directly."
+        )
+        if revised and revised.strip() and revised != "(no output)":
+            reply = revised
     # Auto-attach images: when qwen's reply cites absolute image paths that
     # exist on disk (e.g. something it just generated), send them as photos —
     # a path string is useless on a phone (Zach 2026-07-24: "why can't the
@@ -164,8 +192,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply, parse_mode="Markdown")
     except Exception:
         await update.message.reply_text(reply)
-    # After the user has their reply, not before: this must never add latency.
-    judge_reply(reply, chat_id)
 
 
 def main():
