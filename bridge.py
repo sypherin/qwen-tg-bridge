@@ -21,6 +21,7 @@ Config comes from env (no secrets in code):
 import asyncio
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 
@@ -85,6 +86,36 @@ RUN_TIMEOUT = int(os.environ.get("QWEN_TG_TIMEOUT", "600"))
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
 
+async def _kill_group(proc) -> None:
+    """Kill the whole process tree of a timed-out run, not just the wrapper.
+
+    SIGTERM the group first so node can close sockets cleanly — an abrupt kill
+    mid-request leaves llama-server holding its single slot until the connection
+    drops, which is the exact resource we are trying to free. Then SIGKILL any
+    survivor, because a hung worker that ignores TERM is precisely the case this
+    exists for.
+
+    Never raises: this runs on the failure path, and an exception here would
+    replace a clear "timed out" reply to Zach with a traceback while STILL
+    leaking the processes.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    for sig, wait in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 0.0)):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if wait:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=wait)
+                return                      # exited on TERM, no need to KILL
+            except (asyncio.TimeoutError, ProcessLookupError):
+                continue
+
+
 async def _run(prompt: str, cont: bool) -> tuple[str, str]:
     env = {**os.environ, "OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "sk-local"), "OPENAI_MODEL": MODEL}
     # -c/--continue resumes the most recent session in WORKDIR, so context (and
@@ -96,14 +127,24 @@ async def _run(prompt: str, cont: bool) -> tuple[str, str]:
     args = ["qwen", "-p", prompt, "-o", "text", "-y"]
     if cont:
         args.insert(3, "-c")
+    # start_new_session gives the run its own process group. Without it, the
+    # timeout path below can only reach the direct child (2026-08-10):
+    # `qwen` is a thin node wrapper that spawns the real worker
+    # (node-22 .../qwen-code/cli.js). proc.kill() reaped the wrapper and left the
+    # workers running — they kept generating against :8001 for 10+ minutes AFTER
+    # Zach was told "timed out after 600s", starving the hourly news classifier,
+    # which lost 14 items to 45s read-timeouts before the orphans were killed by
+    # hand. The output could never reach him either, since communicate() had
+    # already been abandoned. Pure waste, invisible from the outside.
     proc = await asyncio.create_subprocess_exec(
         *args, cwd=str(WORKDIR), env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=RUN_TIMEOUT)
     except asyncio.TimeoutError:
-        proc.kill()
+        await _kill_group(proc)
         return "", f"(timed out after {RUN_TIMEOUT}s)"
     return out.decode(errors="replace").strip(), err.decode(errors="replace")
 
