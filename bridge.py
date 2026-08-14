@@ -167,7 +167,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return  # silent: do not engage non-allowlisted chats
     prompt = (update.message.text or update.message.caption or "").strip()
     # Photos: qwen's brain (:8001) is text-only, so hand the agent a file path
-    # plus the `see` CLI (Qwen3-VL on :8080) as its eyes. Largest size wins.
+    # plus the `see` CLI (Qwen3.8-27B VL on :8022) as its eyes. Largest size wins.
     if update.message.photo:
         try:
             tgf = await update.message.photo[-1].get_file()
