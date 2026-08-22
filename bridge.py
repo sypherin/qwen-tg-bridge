@@ -89,8 +89,12 @@ IDLE_TIMEOUT = int(os.environ.get("QWEN_TG_IDLE_TIMEOUT", "1800"))   # 30 min of
 # Absolute wall-clock ceiling even for a run that keeps producing output — a
 # backstop so a pathological loop can't hold the :8022 slot indefinitely.
 # Default 10800s (3h, Zach 2026-08-22); 0 disables it. So a run only ends when it
-# finishes, stalls for 30 min, hits 2h, or you /stop it.
+# finishes, stalls for 30 min, hits 3h, or you /stop it.
 MAX_TIMEOUT = int(os.environ.get("QWEN_TG_MAX_TIMEOUT", "10800"))
+# Heartbeat: while a run is still going, ping Telegram every this-many seconds so
+# a long run (possibly stuck in a loop) surfaces instead of running silently for
+# hours — the message reminds Zach it's alive and that /stop exists. 0 disables.
+HEARTBEAT = int(os.environ.get("QWEN_TG_HEARTBEAT", "1200"))   # 20 min
 
 # One qwen run at a time (single :8022 slot); /stop kills the live one.
 _BUSY = asyncio.Lock()
@@ -129,7 +133,7 @@ async def _kill_group(proc) -> None:
                 continue
 
 
-async def _run(prompt: str, cont: bool) -> tuple[str, str]:
+async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
     env = {**os.environ, "OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "sk-local"), "OPENAI_MODEL": MODEL}
     # -c/--continue resumes the most recent session in WORKDIR, so context (and
     # qwen's built-in auto-compaction) carries across Telegram messages.
@@ -173,19 +177,33 @@ async def _run(prompt: str, cont: bool) -> tuple[str, str]:
 
     pumps = asyncio.gather(_pump(proc.stdout, out_chunks), _pump(proc.stderr, err_chunks))
     start = loop.time()
+    next_beat = start + HEARTBEAT if (HEARTBEAT and notify) else None
     reason = None
     try:
         while proc.returncode is None:
             await asyncio.sleep(5)
             if proc.returncode is not None:
                 break
-            idle = loop.time() - state["last"]
+            now = loop.time()
+            idle = now - state["last"]
             if IDLE_TIMEOUT and idle > IDLE_TIMEOUT:
                 reason = f"stalled — no output for {int(idle)}s (idle limit {IDLE_TIMEOUT}s)"
                 break
-            if MAX_TIMEOUT and (loop.time() - start) > MAX_TIMEOUT:
+            if MAX_TIMEOUT and (now - start) > MAX_TIMEOUT:
                 reason = f"hit max runtime {MAX_TIMEOUT}s"
                 break
+            # Heartbeat: still alive but taking a while — surface it so a possible
+            # loop doesn't run silently. Best-effort; a failed ping never aborts.
+            if next_beat and now >= next_beat:
+                mins = int((now - start) / 60)
+                idle_m = int(idle / 60)
+                try:
+                    await notify(f"⏳ still working — {mins} min elapsed"
+                                 + (f", last output {idle_m} min ago" if idle_m >= 2 else "")
+                                 + ". send /stop if it's going in circles.")
+                except Exception:
+                    pass
+                next_beat = now + HEARTBEAT
         if reason:
             await _kill_group(proc)
     finally:
@@ -210,12 +228,12 @@ async def _run(prompt: str, cont: bool) -> tuple[str, str]:
     return out, err
 
 
-async def run_qwen(prompt: str) -> str:
+async def run_qwen(prompt: str, notify=None) -> str:
     # Continue the running session for continuous context; on cold start (no
     # session yet) -c can fail, so fall back to a fresh run that seeds one.
-    text, err = await _run(prompt, cont=True)
+    text, err = await _run(prompt, cont=True, notify=notify)
     if not text and "No " in err and "session" in err.lower():
-        text, err = await _run(prompt, cont=False)
+        text, err = await _run(prompt, cont=False, notify=notify)
     if text:
         return text[-3800:]
     errtail = "\n".join(l for l in err.splitlines() if "Legacy setting" not in l).strip()
@@ -259,9 +277,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     # Hold the single-run lock across the whole response — the gate revision
     # below also spawns qwen on the same :8022 slot, so it must be serialised too.
+    async def _notify(msg: str):
+        await ctx.bot.send_message(chat_id=chat_id, text=msg)
+
     async with _BUSY:
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
-        reply = await run_qwen(prompt)
+        reply = await run_qwen(prompt, notify=_notify)
 
         # Judgment gate: one bounded revision pass before the user sees anything.
         # Deliberately ONE pass, not a loop — the gate has a ~10% false-positive
