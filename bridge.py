@@ -88,9 +88,9 @@ MODEL = os.environ.get("OPENAI_MODEL", "qwen3.6-35b-a3b")
 IDLE_TIMEOUT = int(os.environ.get("QWEN_TG_IDLE_TIMEOUT", "1800"))   # 30 min of silence = stuck
 # Absolute wall-clock ceiling even for a run that keeps producing output — a
 # backstop so a pathological loop can't hold the :8022 slot indefinitely.
-# Default 7200s (2h, Zach 2026-08-22); 0 disables it. So a run only ends when it
+# Default 10800s (3h, Zach 2026-08-22); 0 disables it. So a run only ends when it
 # finishes, stalls for 30 min, hits 2h, or you /stop it.
-MAX_TIMEOUT = int(os.environ.get("QWEN_TG_MAX_TIMEOUT", "7200"))
+MAX_TIMEOUT = int(os.environ.get("QWEN_TG_MAX_TIMEOUT", "10800"))
 
 # One qwen run at a time (single :8022 slot); /stop kills the live one.
 _BUSY = asyncio.Lock()
