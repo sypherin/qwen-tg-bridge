@@ -118,6 +118,16 @@ def _think_on() -> bool:
 def _set_think(on: bool) -> None:
     THINK_FILE.write_text("on" if on else "off")
 
+# Run-and-fix loop: after a coding run, smoke-test what was produced (execute it / render it
+# headless) and loop the model back on real failures — catches runtime bugs that parse clean
+# but don't work (e.g. a NaN camera -> blank screen). See verify.py. Off via QWEN_TG_VERIFY=0.
+try:
+    import verify as _verify  # sits beside this file
+except Exception:  # noqa: BLE001 — never let a verify import break the bridge
+    _verify = None
+VERIFY_ON = os.environ.get("QWEN_TG_VERIFY", "1") != "0" and _verify is not None
+MAX_FIX_ROUNDS = int(os.environ.get("QWEN_TG_MAX_FIX_ROUNDS", "2"))
+
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -261,6 +271,42 @@ async def run_qwen(prompt: str, notify=None) -> str:
     return errtail[-3800:] if errtail else "(no output)"
 
 
+async def run_qwen_verified(prompt: str, notify=None) -> str:
+    """run_qwen, then smoke-test what it produced and loop it back to fix real failures.
+
+    Only acts when the run actually changed code files (a chat/question is a no-op). Reports
+    failure only on POSITIVE evidence (a runtime error / provably blank canvas), so a broken
+    harness never blocks a reply — see verify.py. Bounded by MAX_FIX_ROUNDS.
+    """
+    if not VERIFY_ON:
+        return await run_qwen(prompt, notify=notify)
+    before = await asyncio.to_thread(_verify.snapshot, WORKDIR)
+    reply = await run_qwen(prompt, notify=notify)
+    attempt = 0
+    while True:
+        after = await asyncio.to_thread(_verify.snapshot, WORKDIR)
+        changed = _verify.changed_since(before, after)
+        if not changed:
+            return reply  # nothing was written — not a coding task
+        if attempt == 0 and notify:
+            await notify("🔍 running it to check it actually works…")
+        res = await asyncio.to_thread(_verify.verify, WORKDIR, changed)
+        if res.ok:
+            return f"{reply}\n\n✅ auto-verified: {res.summary}"
+        if attempt >= MAX_FIX_ROUNDS:
+            return (f"{reply}\n\n⚠️ auto-verify still failing after {attempt} fix "
+                    f"attempt(s): {res.summary}. Left as-is for you to look at.")
+        attempt += 1
+        if notify:
+            await notify(f"⚙️ auto-check caught an issue — fixing ({attempt}/{MAX_FIX_ROUNDS}): {res.summary}")
+        reply = await run_qwen(
+            "The code you just produced FAILED an automated smoke-test.\n"
+            f"{res.fix_hint}\n\n"
+            "Fix it in place in the working directory, then stop. Reply only once it works.",
+            notify=notify,
+        )
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
@@ -303,7 +349,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async with _BUSY:
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
-        reply = await run_qwen(prompt, notify=_notify)
+        reply = await run_qwen_verified(prompt, notify=_notify)
 
         # Judgment gate: one bounded revision pass before the user sees anything.
         # Deliberately ONE pass, not a loop — the gate has a ~10% false-positive

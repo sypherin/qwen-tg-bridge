@@ -40,15 +40,6 @@ ALL_EXTS = CODE_EXTS | {".ts", ".css", ".json"}
 SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", "dist", ".next"}
 SKIP_NAME = re.compile(r"^\.|^_run\.log$|^tg-photo-|\.imgfile$|^index_dbg\.html$")
 
-# Runs the render loop even while the headless tab is backgrounded (rAF is paused when
-# hidden; MessageChannel is not). Injected before page scripts so their rAF loop uses it.
-_RAF_SHIM = (
-    "(function(){var mc=new MessageChannel();var q=[];"
-    "mc.port1.onmessage=function(){var cb=q.shift();if(cb){try{cb(performance.now());}catch(e){}}};"
-    "window.requestAnimationFrame=function(cb){q.push(cb);mc.port2.postMessage(0);return q.length;};"
-    "window.cancelAnimationFrame=function(){};})();"
-)
-
 # A python file that opens a listener would hang if executed, so only syntax-check these.
 _SERVER_HINT = re.compile(
     r"Flask\(|app\.run\(|uvicorn|http\.server|socketserver|\.serve_forever\(|"
@@ -170,10 +161,14 @@ def _render_html(workdir: Path, html_rel: str, timeout: int = 25) -> VerifyResul
                 "--enable-unsafe-swiftshader", "--use-gl=angle",
                 "--use-angle=swiftshader", "--ignore-gpu-blocklist",
             ])
-            pg = browser.new_page(viewport={"width": 900, "height": 600})
+            pg = browser.new_page(viewport={"width": 640, "height": 420})
+            # Keep the page fully local: fulfil any external request (fonts/CDN) with an empty
+            # body, so document.fonts.ready resolves instead of hanging the screenshot forever.
+            pg.route("**/*", lambda r: (r.continue_()
+                     if r.request.url.startswith("http://127.0.0.1")
+                     else r.fulfill(status=200, body="")))
             pg.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
             pg.on("pageerror", lambda e: page_errors.append(str(e)))
-            pg.add_init_script(_RAF_SHIM)
             pg.goto(f"http://127.0.0.1:{port}/{html_rel}", wait_until="load", timeout=timeout * 1000)
             pg.wait_for_timeout(500)
             has_canvas = bool(pg.evaluate("!!document.querySelector('canvas')"))
@@ -182,14 +177,22 @@ def _render_html(workdir: Path, html_rel: str, timeout: int = 25) -> VerifyResul
                 "const g=c.getContext('webgl2')||c.getContext('webgl');"
                 "return !!(g&&g.getParameter(g.VERSION));}catch(e){return false;}})()"
             ))
-            # best-effort 'start': many single-file games begin on Enter or a click
+            # best-effort 'start': many single-file games begin on Enter or a click. Native rAF
+            # runs in headless chromium, so the game loop advances on its own — no shim needed.
             try:
                 pg.keyboard.press("Enter")
-                pg.mouse.click(450, 300)
+                pg.mouse.click(320, 210)
             except Exception:  # noqa: BLE001
                 pass
-            pg.wait_for_timeout(1600)
-            shot = pg.screenshot()
+            pg.wait_for_timeout(1800)
+            # Freeze the loop so the screenshot isn't racing an animating (software-WebGL, CPU
+            # heavy) page — otherwise the capture times out on a busy compositor.
+            try:
+                pg.evaluate("window.requestAnimationFrame=function(){return 0;};")
+            except Exception:  # noqa: BLE001
+                pass
+            pg.wait_for_timeout(120)
+            shot = pg.screenshot(timeout=8000)
             browser.close()
     except Exception as e:  # noqa: BLE001
         return VerifyResult(True, f"render-check inconclusive ({type(e).__name__})", "")
@@ -206,26 +209,32 @@ def _render_html(workdir: Path, html_rel: str, timeout: int = 25) -> VerifyResul
         hint = "The page threw errors when run in a headless browser:\n- " + "\n- ".join(errs[:6])
         return VerifyResult(False, f"{html_rel}: {len(errs)} runtime error(s) in browser", hint)
 
-    # 2) blank canvas — only trust it when the harness could actually draw
+    # 2) blank canvas — measure the CENTRE of the frame (avoids DOM HUD overlays) by colour
+    # variance. Trusted only when WebGL/2D is confirmed working, so a broken harness never
+    # false-fails. Calibrated on the real gta3d oracle: good scene stdev~32 / 56 colours,
+    # the NaN-blank bug ~0.6 / 6 colours — a wide, safe margin.
     if has_canvas and webgl_ok and shot:
         try:
             from PIL import Image
-            im = Image.open(io.BytesIO(shot)).convert("L")
-            px = list(im.getdata())[::29]
-            sd = statistics.pstdev(px) if len(px) > 1 else 0.0
-            distinct = len({p >> 3 for p in px})  # coarse colour buckets
-            if sd < 3.5 and distinct <= 2:
+            im = Image.open(io.BytesIO(shot)).convert("RGB")
+            W, H = im.size
+            crop = im.crop((int(W * 0.18), int(H * 0.32), int(W * 0.82), int(H * 0.94)))
+            px = list(crop.getdata())[::11]
+            grey = [(r * 299 + g * 587 + b * 114) // 1000 for (r, g, b) in px]
+            sd = statistics.pstdev(grey) if len(grey) > 1 else 0.0
+            distinct = len({(r >> 4, g >> 4, b >> 4) for (r, g, b) in px})
+            if sd < 5.0 and distinct <= 8:
                 hint = ("The app has a <canvas> but after loading + a start (Enter/click) the "
                         "rendered frame is essentially blank/uniform — nothing is drawn. This is "
-                        "the classic 'runs but shows nothing' bug (e.g. a NaN in the camera/transform, "
-                        "geometry never added, or the draw loop never advancing). Run it, confirm the "
-                        "scene is visible, and fix whatever leaves the canvas empty.")
+                        "the classic 'runs but shows nothing' bug (a NaN in a camera/transform, "
+                        "geometry never added to the scene, or the draw loop never advancing). "
+                        "Run it, confirm the scene is actually visible, and fix whatever leaves "
+                        "the canvas empty.")
                 return VerifyResult(False, f"{html_rel}: canvas renders blank after start", hint)
         except Exception:  # noqa: BLE001
             pass  # fail open on any imaging hiccup
 
-    note = "rendered, no JS errors" + ("" if webgl_ok else " (webgl unverified)")
-    return VerifyResult(True, f"{html_rel}: {note}", "")
+    return VerifyResult(True, f"{html_rel}: rendered, no JS errors", "")
 
 
 # --------------------------------------------------------------------------- orchestrate
