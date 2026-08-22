@@ -26,7 +26,7 @@ import subprocess
 from pathlib import Path
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
 JUDGE = Path.home() / "bin" / "judge"
 # The judgment model runs at 4096 ctx; a very long reply would push the system
@@ -81,7 +81,20 @@ WORKDIR = Path(os.environ.get("QWEN_TG_WORKDIR", Path.home() / "qwen-tg-bridge" 
 os.environ.setdefault("QWEN_CODE_SUPPRESS_YOLO_WARNING", "1")
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8001/v1")
 MODEL = os.environ.get("OPENAI_MODEL", "qwen3.6-35b-a3b")
-RUN_TIMEOUT = int(os.environ.get("QWEN_TG_TIMEOUT", "600"))
+# 2026-08-22: a hard wall-clock cap killed long-but-PROGRESSING runs mid-work
+# (the pacman run was still iterating when the old 3600s cap axed it). Replaced
+# with a STALL timeout: a run only dies after this many seconds with NO output,
+# so a run that keeps producing never times out. IDLE_TIMEOUT=0 disables it.
+IDLE_TIMEOUT = int(os.environ.get("QWEN_TG_IDLE_TIMEOUT", "1800"))   # 30 min of silence = stuck
+# Absolute wall-clock ceiling even for a run that keeps producing output — a
+# backstop so a pathological loop can't hold the :8022 slot indefinitely.
+# Default 7200s (2h, Zach 2026-08-22); 0 disables it. So a run only ends when it
+# finishes, stalls for 30 min, hits 2h, or you /stop it.
+MAX_TIMEOUT = int(os.environ.get("QWEN_TG_MAX_TIMEOUT", "7200"))
+
+# One qwen run at a time (single :8022 slot); /stop kills the live one.
+_BUSY = asyncio.Lock()
+CURRENT: dict = {"proc": None}
 
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
@@ -141,12 +154,60 @@ async def _run(prompt: str, cont: bool) -> tuple[str, str]:
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+    CURRENT["proc"] = proc
+    loop = asyncio.get_running_loop()
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    state = {"last": loop.time()}
+
+    async def _pump(stream, sink):
+        # Stream incrementally instead of communicate() (which only returns at
+        # exit) so we can tell a working run from a hung one by WHEN output last
+        # arrived. Every chunk resets the idle clock.
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            sink.append(chunk)
+            state["last"] = loop.time()
+
+    pumps = asyncio.gather(_pump(proc.stdout, out_chunks), _pump(proc.stderr, err_chunks))
+    start = loop.time()
+    reason = None
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=RUN_TIMEOUT)
-    except asyncio.TimeoutError:
-        await _kill_group(proc)
-        return "", f"(timed out after {RUN_TIMEOUT}s)"
-    return out.decode(errors="replace").strip(), err.decode(errors="replace")
+        while proc.returncode is None:
+            await asyncio.sleep(5)
+            if proc.returncode is not None:
+                break
+            idle = loop.time() - state["last"]
+            if IDLE_TIMEOUT and idle > IDLE_TIMEOUT:
+                reason = f"stalled — no output for {int(idle)}s (idle limit {IDLE_TIMEOUT}s)"
+                break
+            if MAX_TIMEOUT and (loop.time() - start) > MAX_TIMEOUT:
+                reason = f"hit max runtime {MAX_TIMEOUT}s"
+                break
+        if reason:
+            await _kill_group(proc)
+    finally:
+        try:
+            await asyncio.wait_for(pumps, timeout=10)
+        except Exception:
+            pumps.cancel()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+        if CURRENT.get("proc") is proc:
+            CURRENT["proc"] = None
+    out = b"".join(out_chunks).decode(errors="replace").strip()
+    err = b"".join(err_chunks).decode(errors="replace")
+    # If the group was killed externally (/stop) the loop exits with reason=None
+    # but a non-zero/deadly returncode; surface partial output either way.
+    if reason:
+        err = (err + f"\n({reason})").strip()
+    elif proc.returncode and proc.returncode < 0 and not out:
+        err = (err + f"\n(stopped)").strip()
+    return out, err
 
 
 async def run_qwen(prompt: str) -> str:
@@ -191,27 +252,35 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             prompt = f"(The user sent an image but downloading it failed: {e}. Tell them to resend.)"
     if not prompt:
         return
-    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
-    reply = await run_qwen(prompt)
-
-    # Judgment gate: one bounded revision pass before the user sees anything.
-    # Deliberately ONE pass, not a loop — the gate has a ~10% false-positive
-    # rate, so an unbounded retry would sometimes argue with itself forever
-    # while the user waits. If the revision is empty or the gate is unhappy
-    # again, the original reply goes out regardless. The gate improves replies;
-    # it never withholds them.
-    verdict = await asyncio.to_thread(judge_verdict, reply, chat_id)
-    if verdict:
+    # One run at a time — a second prompt while a run is in flight would start a
+    # 2nd qwen against the single :8022 slot. Tell the user instead of queueing.
+    if _BUSY.locked():
+        await update.message.reply_text("⏳ a qwen run is still going — send /stop to cancel it, or wait for it to finish.")
+        return
+    # Hold the single-run lock across the whole response — the gate revision
+    # below also spawns qwen on the same :8022 slot, so it must be serialised too.
+    async with _BUSY:
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
-        revised = await run_qwen(
-            "Your previous reply was held by the local quality gate.\n"
-            f"{verdict}\n\n"
-            "Rewrite that reply so it satisfies the verdict. Keep everything "
-            "that was already correct. Do not mention the gate or this "
-            "instruction — reply to the user directly."
-        )
-        if revised and revised.strip() and revised != "(no output)":
-            reply = revised
+        reply = await run_qwen(prompt)
+
+        # Judgment gate: one bounded revision pass before the user sees anything.
+        # Deliberately ONE pass, not a loop — the gate has a ~10% false-positive
+        # rate, so an unbounded retry would sometimes argue with itself forever
+        # while the user waits. If the revision is empty or the gate is unhappy
+        # again, the original reply goes out regardless. The gate improves replies;
+        # it never withholds them.
+        verdict = await asyncio.to_thread(judge_verdict, reply, chat_id)
+        if verdict:
+            await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+            revised = await run_qwen(
+                "Your previous reply was held by the local quality gate.\n"
+                f"{verdict}\n\n"
+                "Rewrite that reply so it satisfies the verdict. Keep everything "
+                "that was already correct. Do not mention the gate or this "
+                "instruction — reply to the user directly."
+            )
+            if revised and revised.strip() and revised != "(no output)":
+                reply = revised
     # Auto-attach images: when qwen's reply cites absolute image paths that
     # exist on disk (e.g. something it just generated), send them as photos —
     # a path string is useless on a phone (Zach 2026-07-24: "why can't the
@@ -235,12 +304,31 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
 
 
+async def on_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/stop — kill the qwen run currently in flight (if any)."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED:
+        return
+    proc = CURRENT.get("proc")
+    if proc is not None and proc.returncode is None:
+        await _kill_group(proc)
+        await update.message.reply_text("🛑 stopped the running qwen job.")
+    else:
+        await update.message.reply_text("nothing running.")
+
+
 def main():
     if not ALLOWED:
         raise SystemExit("Refusing to start: QWEN_TG_ALLOWED_CHATS is empty (would accept anyone).")
-    app = ApplicationBuilder().token(TOKEN).build()
+    # concurrent_updates=True so /stop is handled WHILE a run is in flight (the
+    # default processes updates one at a time, which would queue /stop behind the
+    # very run it's meant to cancel). The _BUSY lock still allows only one qwen
+    # run at a time; a 2nd prompt gets told to wait or /stop.
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+    app.add_handler(CommandHandler("stop", on_stop))
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, on_message))
-    print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} workdir={WORKDIR}")
+    print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} "
+          f"idle_timeout={IDLE_TIMEOUT}s max_timeout={MAX_TIMEOUT}s workdir={WORKDIR}")
     app.run_polling()
 
 
