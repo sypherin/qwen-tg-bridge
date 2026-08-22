@@ -100,6 +100,24 @@ HEARTBEAT = int(os.environ.get("QWEN_TG_HEARTBEAT", "1200"))   # 20 min
 _BUSY = asyncio.Lock()
 CURRENT: dict = {"proc": None}
 
+# Reasoning switch (2026-08-22). :8022 toggles thinking per-request via
+# chat_template_kwargs.enable_thinking; Qwen Code carries that through a second
+# provider id `qwen3.8-27b-think` (extra_body) in ~/.qwen/settings.json. /think
+# on|off just picks which -m the bot passes — client-side, so site chat / Deneb
+# on :8022 are unaffected. State persists in a file across bridge restarts.
+MODEL_THINK = os.environ.get("QWEN_TG_MODEL_THINK", "qwen3.8-27b-think")
+MODEL_PLAIN = os.environ.get("QWEN_TG_MODEL_PLAIN", MODEL)
+THINK_FILE = Path.home() / "qwen-tg-bridge" / "think_mode"
+
+def _think_on() -> bool:
+    try:
+        return THINK_FILE.read_text().strip().lower() == "on"
+    except Exception:
+        return False   # default off (fast)
+
+def _set_think(on: bool) -> None:
+    THINK_FILE.write_text("on" if on else "off")
+
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -141,7 +159,10 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
     # tool calls stall ("requires user approval but cannot execute in
     # non-interactive mode", seen live 2026-07-24 on a photo message).
     # Acceptable because the chat allowlist is Zach only.
-    args = ["qwen", "-p", prompt, "-o", "text", "-y"]
+    # Reasoning on/off = which provider id we select (both point at :8022; the
+    # -think one carries extra_body.chat_template_kwargs.enable_thinking).
+    model = MODEL_THINK if _think_on() else MODEL_PLAIN
+    args = ["qwen", "-p", prompt, "-o", "text", "-y", "-m", model]
     if cont:
         args.insert(3, "-c")
     # start_new_session gives the run its own process group. Without it, the
@@ -338,6 +359,28 @@ async def on_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("nothing running.")
 
 
+async def on_think(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/think [on|off] — toggle reasoning for coding runs (default off = faster).
+    Client-side (picks the -think model id); does not affect other :8022 users."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED:
+        return
+    arg = ""
+    if update.message and update.message.text:
+        parts = update.message.text.split()
+        arg = parts[1].lower() if len(parts) > 1 else ""
+    if arg in ("on", "off"):
+        _set_think(arg == "on")
+        await update.message.reply_text(
+            f"🧠 reasoning {'ON' if arg == 'on' else 'OFF'} for coding runs"
+            + (" (slower, better on hard tasks)" if arg == "on" else " (faster)")
+        )
+    else:
+        await update.message.reply_text(
+            f"reasoning is currently {'ON' if _think_on() else 'OFF'}. use /think on or /think off."
+        )
+
+
 def main():
     if not ALLOWED:
         raise SystemExit("Refusing to start: QWEN_TG_ALLOWED_CHATS is empty (would accept anyone).")
@@ -347,6 +390,7 @@ def main():
     # run at a time; a 2nd prompt gets told to wait or /stop.
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("stop", on_stop))
+    app.add_handler(CommandHandler("think", on_think))
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, on_message))
     print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} "
           f"idle_timeout={IDLE_TIMEOUT}s max_timeout={MAX_TIMEOUT}s workdir={WORKDIR}")
