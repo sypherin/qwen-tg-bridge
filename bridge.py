@@ -204,7 +204,7 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
     loop = asyncio.get_running_loop()
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
-    state = {"last": loop.time(), "result": None, "texts": [], "last_prog": 0.0, "tools": 0}
+    state = {"last": loop.time(), "result": None, "texts": [], "think": "", "last_prog": 0.0, "tools": 0}
     print(f"\n=== run start{' (cont)' if cont else ''} | model={model} ===", flush=True)
     print(f"prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}", flush=True)
 
@@ -330,6 +330,21 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
                 except Exception:
                     pass
                 next_beat = now + HEARTBEAT
+            # Wait-phase ticks (2026-09-01): the qwen CLI sits silent for
+            # ~1-4 min during node boot + tool listing before the first event
+            # streams. Tick the pane AND the Telegram bubble every 30s so a
+            # run is never indistinguishable from a hang (Zach: "i dont see
+            # any streaming"). Coordinates with _progress_tick via last_prog.
+            if progress and (now - state["last_prog"]) >= 30:
+                state["last_prog"] = now
+                phase = ("qwen cli spinning up" if not (state["think"] or state["texts"])
+                         else "working")
+                try:
+                    await progress(f"⏳ {phase} · {int(now - start)}s")
+                except Exception:
+                    pass
+                _pane(f"[beat] alive · {int(now - start)}s"
+                      + (f" tools={state['tools']}" if state["tools"] else ""))
         if reason:
             await _kill_group(proc)
     finally:
@@ -462,6 +477,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async with _BUSY:
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+        # Bubble appears IMMEDIATELY (the CLI's 1-4 min silent boot made
+        # "no streaming" indistinguishable from "nothing happened").
+        try:
+            prog["msg"] = await ctx.bot.send_message(chat_id=chat_id, text="⚙️ qwen starting…")
+        except Exception:
+            pass
         reply = await run_qwen_verified(prompt, notify=_notify, progress=_progress)
 
         # Judgment gate: one bounded revision pass before the user sees anything.
