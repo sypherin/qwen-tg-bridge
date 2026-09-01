@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
 JUDGE = Path.home() / "bin" / "judge"
@@ -123,10 +123,15 @@ HEARTBEAT = int(os.environ.get("QWEN_TG_HEARTBEAT", "1200"))   # 20 min
 # Live progress: while a run streams, edit a Telegram "status" message at most
 # this often (seconds) with the latest reasoning tail / tool call. 0 disables.
 PROGRESS_EVERY = int(os.environ.get("QWEN_TG_PROGRESS_EVERY", "8"))
+# Run-metadata footer on every substantive reply (2026-09-02, after Hermes'
+# /footer): model · wall time · tool count — live-run observability. 0 disables.
+FOOTER = os.environ.get("QWEN_TG_FOOTER", "1") != "0"
 
 # One qwen run at a time (single :8022 slot); /stop kills the live one.
 _BUSY = asyncio.Lock()
 CURRENT: dict = {"proc": None}
+LAST: dict = {"prompt": None}   # last fully-constructed prompt (/retry re-sends it)
+LAST_RUN: dict = {}             # last run metadata {model, secs, tools} → footer
 
 # Reasoning switch (2026-08-22). :8022 toggles thinking per-request via
 # chat_template_kwargs.enable_thinking; Qwen Code carries that through a second
@@ -446,6 +451,7 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
            or b"".join(out_chunks).decode(errors="replace").strip())
     err = b"".join(err_chunks).decode(errors="replace")
     print(f"\n=== run end rc={proc.returncode} out={len(out)}B err={len(err)}B ===", flush=True)
+    LAST_RUN.update({"model": model, "secs": int(loop.time() - start), "tools": state["tools"]})
     # If the group was killed externally (/stop) the loop exits with reason=None
     # but a non-zero/deadly returncode; surface partial output either way.
     if reason:
@@ -578,8 +584,41 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                               + (f"\n\n(They also added this caption: {cap})" if cap else ""))
         except Exception as e:  # noqa: BLE001 — download failure — never drop silently
             prompt = f"(The user sent a voice message but downloading it failed: {e}. Tell them to resend.)"
+    # Documents (2026-09-02, after Hermes' gateway media handling): PDFs, code
+    # files, data files — download to WORKDIR and hand the agent the path. It
+    # reads them with its own tools; no transcription needed.
+    doc = update.message.document
+    if doc is not None:
+        try:
+            if doc.file_size and doc.file_size > 20_000_000:
+                prompt = (f"(The user sent a file '{doc.file_name}' but it is "
+                          f"{doc.file_size // 1_000_000}MB — over the 20MB limit. "
+                          "Tell them to send a smaller file or a path that exists on the box.)")
+            else:
+                tgf = await doc.get_file()
+                safe = re.sub(r"[^A-Za-z0-9_.-]", "_", doc.file_name or "file")[:80] or "file"
+                doc_path = WORKDIR / f"tg-doc-{update.message.message_id}-{safe}"
+                await tgf.download_to_drive(str(doc_path))
+                prompt = (
+                    f"The user sent a file, saved at {doc_path}. Read it with the "
+                    "appropriate tool first (it may be PDF, text, code, or data), "
+                    "then answer the user."
+                    + (f" User's caption: {prompt}" if prompt
+                       else " The user sent no caption; open it and summarize what it contains, surfacing anything notable.")
+                )
+        except Exception as e:  # noqa: BLE001 — never drop a message silently
+            prompt = f"(The user sent a file but downloading it failed: {e}. Tell them to resend.)"
     if not prompt:
         return
+    LAST["prompt"] = prompt          # /retry re-sends whatever ran last
+    await _handle_prompt(prompt, update, ctx)
+
+
+async def _handle_prompt(prompt: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a fully-constructed prompt (from on_message or /retry): busy gate,
+    status bubble, verified run, judge gate, media attach, metadata footer,
+    final reply."""
+    chat_id = update.effective_chat.id
     # One run at a time — a second prompt while a run is in flight would start a
     # 2nd qwen against the single :8022 slot. Tell the user instead of queueing.
     if _BUSY.locked():
@@ -670,6 +709,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_photo(chat_id=chat_id, photo=fh)
     except Exception:
         pass  # photo attach is best-effort; the text reply below always goes
+    # Run-metadata footer (2026-09-02, after Hermes' /footer): model · wall
+    # time · tool count on every substantive reply. Never on placeholders.
+    if FOOTER and reply.strip() not in PLACEHOLDERS:
+        reply += (f"\n\n— {LAST_RUN.get('model', '?')} · {int(LAST_RUN.get('secs', 0))}s"
+                  + (f" · {LAST_RUN['tools']} tools" if LAST_RUN.get("tools") else ""))
     # Render markdown (bold, code blocks) when it parses; fall back to plain text
     # so a stray * or _ never turns into a silent 400 from Telegram.
     try:
@@ -769,6 +813,68 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+async def on_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/retry — re-run the last prompt (after Hermes' /retry). Re-sends the exact
+    fully-constructed prompt (incl. photo/voice/document wrappers) into the
+    current session."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED:
+        return
+    p = LAST.get("prompt")
+    if not p:
+        await update.message.reply_text("nothing to retry yet.")
+        return
+    await update.message.reply_text("🔁 re-running the last prompt…")
+    await _handle_prompt(p, update, ctx)
+
+
+async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/status — current model routing, toggles, run state, workdir (after
+    Hermes' /status). One glance answers "what will my next msg hit"."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED:
+        return
+    model = MODEL_FAST if _fast_on() else (MODEL_THINK if _think_on() else MODEL_PLAIN)
+    proc = CURRENT.get("proc")
+    busy = proc is not None and proc.returncode is None
+    await update.message.reply_text(
+        f"📡 model: {model}\n"
+        f"🧠 think: {'ON' if _think_on() else 'OFF'} · ⚡ fast: {'ON' if _fast_on() else 'OFF'}"
+        + (" (fast overrides think)" if _fast_on() else "") + "\n"
+        f"🔄 run in flight: {'yes — /stop to cancel' if busy else 'no'}\n"
+        f"🆕 fresh session armed: {'yes' if FRESH_FILE.exists() else 'no'}\n"
+        f"📁 workdir: {WORKDIR}"
+    )
+
+
+async def on_edit_notice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Edited messages are deliberately not re-run (an edit would redo the file
+    writes of a coding run). But silence reads as the bot being dead — say so."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED:
+        return
+    await update.effective_message.reply_text(
+        "✏️ edits are ignored — a re-run would redo the run's file writes. send it as a new message instead."
+    )
+
+
+async def _post_init(app) -> None:
+    """Register the command menu with Telegram (after Hermes' gateway, which
+    derives its TG menu from the command registry) — so /stop /new /status …
+    autocomplete in the chat UI instead of having to be remembered."""
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("new", "start a fresh session on the next message"),
+            BotCommand("stop", "kill the running job"),
+            BotCommand("status", "model routing, toggles, run state"),
+            BotCommand("retry", "re-run the last prompt"),
+            BotCommand("think", "reasoning on|off"),
+            BotCommand("fast", "fast lane on|off (:8001 MoE)"),
+        ])
+    except Exception as e:  # noqa: BLE001 — cosmetic, never fatal
+        _pane_log(f"[menu] set_my_commands failed: {e}")
+
+
 def main():
     if not ALLOWED:
         raise SystemExit("Refusing to start: QWEN_TG_ALLOWED_CHATS is empty (would accept anyone).")
@@ -776,18 +882,21 @@ def main():
     # default processes updates one at a time, which would queue /stop behind the
     # very run it's meant to cancel). The _BUSY lock still allows only one qwen
     # run at a time; a 2nd prompt gets told to wait or /stop.
-    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
     app.add_handler(CommandHandler("stop", on_stop))
     app.add_handler(CommandHandler("think", on_think))
     app.add_handler(CommandHandler("fast", on_fast))
     app.add_handler(CommandHandler("new", on_new))
+    app.add_handler(CommandHandler("status", on_status))
+    app.add_handler(CommandHandler("retry", on_retry))
     app.add_error_handler(on_error)
-    # filters.UpdateType.MESSAGE (fixed 2026-09-02): without it MessageHandler
-    # ALSO fires for edited_message updates, where update.message is None ->
+    # UpdateType.MESSAGE (fixed 2026-09-02): without it MessageHandler ALSO
+    # fires for edited_message updates, where update.message is None ->
     # AttributeError at the .text read (and an edit would re-run the prompt).
-    app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO)
-        & ~filters.COMMAND & filters.UpdateType.MESSAGE, on_message))
+    _media = (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL) & ~filters.COMMAND
+    app.add_handler(MessageHandler(_media & filters.UpdateType.MESSAGE, on_message))
+    # Edits: not re-run, but acknowledged — silence reads as a dead bot.
+    app.add_handler(MessageHandler(_media & filters.UpdateType.EDITED_MESSAGE, on_edit_notice))
     print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} "
           f"idle_timeout={IDLE_TIMEOUT}s max_timeout={MAX_TIMEOUT}s workdir={WORKDIR}")
     app.run_polling()
