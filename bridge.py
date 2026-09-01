@@ -51,7 +51,7 @@ def _transcribe(path: Path) -> str:
     """Voice note -> text. Raises on failure; empty string = nothing intelligible."""
     try:
         p = subprocess.run(
-            ["python3", str(HEAR), str(path)],
+            [sys.executable, str(HEAR), str(path)],
             capture_output=True, text=True, timeout=HEAR_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
