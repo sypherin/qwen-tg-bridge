@@ -213,6 +213,23 @@ def _pane_log(line: str) -> None:
         pass
 
 
+def _is_stale(update) -> bool:
+    """True (and logged) if this update was sent more than STALE_AFTER seconds
+    ago — a restart-replay of something Telegram queued while the bridge was
+    down. Checked for COMMANDS as well as prompts (review 2026-09-02): a
+    replayed /new arms a fresh session nobody asked for, a replayed /think or
+    /fast flips persisted state, a replayed /retry fires a surprise run."""
+    msg = getattr(update, "effective_message", None)
+    if not STALE_AFTER or msg is None or msg.date is None:
+        return False
+    age = (datetime.now(timezone.utc) - msg.date).total_seconds()
+    if age <= STALE_AFTER:
+        return False
+    _pane_log(f"[drop] stale update {msg.message_id} sent {msg.date:%Y-%m-%d %H:%M} UTC "
+              f"({int(age // 60)} min ago) — not replaying")
+    return True
+
+
 async def _kill_group(proc) -> None:
     """Kill the whole process tree of a timed-out run, not just the wrapper.
 
@@ -451,7 +468,12 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
            or b"".join(out_chunks).decode(errors="replace").strip())
     err = b"".join(err_chunks).decode(errors="replace")
     print(f"\n=== run end rc={proc.returncode} out={len(out)}B err={len(err)}B ===", flush=True)
-    LAST_RUN.update({"model": model, "secs": int(loop.time() - start), "tools": state["tools"]})
+    # Accumulate across the sub-runs of ONE reply (verify-fix rounds, judge
+    # revision); _handle_prompt clears this before the first run, so the footer
+    # shows total wall time / tool calls, not only the last sub-run's.
+    LAST_RUN["model"] = model
+    LAST_RUN["secs"] = LAST_RUN.get("secs", 0) + int(loop.time() - start)
+    LAST_RUN["tools"] = LAST_RUN.get("tools", 0) + state["tools"]
     # If the group was killed externally (/stop) the loop exits with reason=None
     # but a non-zero/deadly returncode; surface partial output either way.
     if reason:
@@ -472,7 +494,10 @@ async def run_qwen(prompt: str, notify=None, progress=None, fresh: bool = False)
     # Loosened 2026-09-02: was `"No " in err` — exact-case; a lowercase
     # "no session to continue" slipped through and surfaced raw stderr instead
     # of retrying fresh. Only meaningful when we actually asked to resume.
-    if not text and cont and "no " in err.lower() and "session" in err.lower():
+    # Review 2026-09-02: "no " and "session" anywhere in stderr was too loose —
+    # a session banner plus an unrelated "no such file" would silently reset
+    # the context. Require them on one line, within 40 chars.
+    if not text and cont and re.search(r"\bno\b[^\n]{0,40}\bsession", err, re.I):
         text, err = await _run(prompt, cont=False, notify=notify, progress=progress)
     if text:
         return text[-3800:]
@@ -526,8 +551,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # run (and clobbering /new state) is worse than dropping it.
     if update.message is None:
         return  # edited_message/channel_post — update.message would crash below
-    if STALE_AFTER and (datetime.now(timezone.utc) - update.message.date).total_seconds() > STALE_AFTER:
-        _pane_log(f"[drop] stale message {update.message.message_id} sent {update.message.date:%Y-%m-%d %H:%M} UTC — not replaying")
+    if _is_stale(update):
         return
     prompt = (update.message.text or update.message.caption or "").strip()
     # Photos: qwen's brain (:8001) is text-only, so hand the agent a file path
@@ -610,7 +634,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             prompt = f"(The user sent a file but downloading it failed: {e}. Tell them to resend.)"
     if not prompt:
         return
-    LAST["prompt"] = prompt          # /retry re-sends whatever ran last
+    # /retry re-sends this. Set BEFORE the busy gate on purpose: a prompt that
+    # bounced off "a qwen run is still going" is exactly what you /retry next.
+    LAST["prompt"] = prompt
     await _handle_prompt(prompt, update, ctx)
 
 
@@ -645,6 +671,7 @@ async def _handle_prompt(prompt: str, update: Update, ctx: ContextTypes.DEFAULT_
             pass  # progress is cosmetic — never let it break the run
 
     async with _BUSY:
+        LAST_RUN.clear()   # footer totals are per reply, see _run
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
         # Bubble appears IMMEDIATELY (the CLI's 1-4 min silent boot made
         # "no streaming" indistinguishable from "nothing happened").
@@ -727,6 +754,8 @@ async def on_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
         return
+    if _is_stale(update):
+        return
     proc = CURRENT.get("proc")
     if proc is not None and proc.returncode is None:
         await _kill_group(proc)
@@ -740,6 +769,8 @@ async def on_think(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Client-side (picks the -think model id); does not affect other :8022 users."""
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
+        return
+    if _is_stale(update):
         return
     arg = ""
     if update.message and update.message.text:
@@ -761,6 +792,8 @@ async def on_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/fast [on|off] — route runs to the :8001 MoE for simple tasks (overrides /think)."""
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
+        return
+    if _is_stale(update):
         return
     arg = ""
     if update.message and update.message.text:
@@ -789,6 +822,8 @@ async def on_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
+        return
+    if _is_stale(update):
         return
     FRESH_FILE.write_text("on")
     await update.message.reply_text("🆕 fresh session armed — your next message starts clean (old context dropped).")
@@ -820,6 +855,8 @@ async def on_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
         return
+    if _is_stale(update):
+        return
     p = LAST.get("prompt")
     if not p:
         await update.message.reply_text("nothing to retry yet.")
@@ -834,9 +871,12 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
         return
+    if _is_stale(update):
+        return
     model = MODEL_FAST if _fast_on() else (MODEL_THINK if _think_on() else MODEL_PLAIN)
-    proc = CURRENT.get("proc")
-    busy = proc is not None and proc.returncode is None
+    # The lock, not CURRENT["proc"]: between the sub-runs of one reply
+    # (verify-fix round, judge revision) the proc is None but the slot is held.
+    busy = _BUSY.locked()
     await update.message.reply_text(
         f"📡 model: {model}\n"
         f"🧠 think: {'ON' if _think_on() else 'OFF'} · ⚡ fast: {'ON' if _fast_on() else 'OFF'}"
@@ -852,6 +892,8 @@ async def on_edit_notice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     writes of a coding run). But silence reads as the bot being dead — say so."""
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
+        return
+    if _is_stale(update):
         return
     await update.effective_message.reply_text(
         "✏️ edits are ignored — a re-run would redo the run's file writes. send it as a new message instead."
