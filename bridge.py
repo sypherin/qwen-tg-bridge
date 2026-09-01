@@ -19,6 +19,7 @@ Config comes from env (no secrets in code):
   OPENAI_MODEL             default qwen3.6-35b-a3b
 """
 import asyncio
+import json
 import os
 import re
 import signal
@@ -97,6 +98,9 @@ MAX_TIMEOUT = int(os.environ.get("QWEN_TG_MAX_TIMEOUT", "10800"))
 # a long run (possibly stuck in a loop) surfaces instead of running silently for
 # hours — the message reminds Zach it's alive and that /stop exists. 0 disables.
 HEARTBEAT = int(os.environ.get("QWEN_TG_HEARTBEAT", "1200"))   # 20 min
+# Live progress: while a run streams, edit a Telegram "status" message at most
+# this often (seconds) with the latest reasoning tail / tool call. 0 disables.
+PROGRESS_EVERY = int(os.environ.get("QWEN_TG_PROGRESS_EVERY", "8"))
 
 # One qwen run at a time (single :8022 slot); /stop kills the live one.
 _BUSY = asyncio.Lock()
@@ -163,7 +167,7 @@ async def _kill_group(proc) -> None:
                 continue
 
 
-async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
+async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str, str]:
     env = {**os.environ, "OPENAI_BASE_URL": BASE_URL, "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "sk-local"), "OPENAI_MODEL": MODEL}
     # -c/--continue resumes the most recent session in WORKDIR, so context (and
     # qwen's built-in auto-compaction) carries across Telegram messages.
@@ -174,7 +178,12 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
     # Reasoning on/off = which provider id we select (both point at :8022; the
     # -think one carries extra_body.chat_template_kwargs.enable_thinking).
     model = MODEL_THINK if _think_on() else MODEL_PLAIN
-    args = ["qwen", "-p", prompt, "-o", "text", "-y", "-m", model]
+    # -o stream-json (2026-09-01): emits claude-code-style ndjson events on
+    # stdout — assistant content blocks (thinking / text / tool_use) plus a
+    # final {type:"result"} carrying the reply. We parse them live so the
+    # tmux pane shows pretty progress AND Telegram gets edited status updates
+    # with the reasoning tail (previously: silent until the final answer).
+    args = ["qwen", "-p", prompt, "-o", "stream-json", "-y", "-m", model]
     if cont:
         args.insert(3, "-c")
     # start_new_session gives the run its own process group. Without it, the
@@ -195,18 +204,91 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
-    state = {"last": loop.time()}
+    state = {"last": loop.time(), "result": None, "texts": [], "last_prog": 0.0, "tools": 0}
     print(f"\n=== run start{' (cont)' if cont else ''} | model={model} ===", flush=True)
     print(f"prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}", flush=True)
 
-    async def _pump(stream, sink):
-        # Stream incrementally instead of communicate() (which only returns at
-        # exit) so we can tell a working run from a hung one by WHEN output last
-        # arrived. Every chunk resets the idle clock.
-        # Each chunk is ALSO tee'd to our own stdout, so `tmux attach -t qwentg`
-        # shows live what qwen is doing (tool calls / progress / the reply as it
-        # streams) instead of a silent pane — the run is otherwise invisible
-        # until the final answer lands in Telegram (Zach 2026-09-01).
+    def _pane(line: str) -> None:
+        # pretty progress → tmux pane (`tmux attach -t qwentg`), best-effort
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass  # a display glitch must never kill the run
+
+    async def _progress_tick(label: str, detail: str) -> None:
+        # throttled live status to Telegram: latest reasoning tail / tool call
+        if not progress or not PROGRESS_EVERY:
+            return
+        now = loop.time()
+        if now - state["last_prog"] < PROGRESS_EVERY:
+            return
+        state["last_prog"] = now
+        try:
+            await progress(f"{label} {detail}"[:220] + f" · {int(now - start)}s")
+        except Exception:
+            pass
+
+    async def _handle_event(j: dict) -> None:
+        t = j.get("type")
+        if t == "assistant":
+            for b in j.get("message", {}).get("content", []) or []:
+                bt = b.get("type")
+                if bt == "thinking":
+                    th = " ".join((b.get("thinking") or "").split())
+                    if th:
+                        state["think"] = th
+                        _pane(f"[think] {th[:180]}")
+                        await _progress_tick("🧠", th[-140:])
+                elif bt == "text":
+                    tx = " ".join((b.get("text") or "").split())
+                    if tx:
+                        state["texts"].append(tx)
+                        _pane(f"[text] {tx[:180]}")
+                elif bt == "tool_use":
+                    state["tools"] += 1
+                    name = b.get("name", "?")
+                    try:
+                        inp = json.dumps(b.get("input") or {}, ensure_ascii=False)[:100]
+                    except Exception:
+                        inp = ""
+                    _pane(f"[tool] {name} {inp}")
+                    await _progress_tick("🔧", f"{name} {inp}"[:140])
+        elif t == "result":
+            r = j.get("result")
+            if isinstance(r, str) and r:
+                state["result"] = r
+            _pane(f"[done] {j.get('subtype')} turns={j.get('num_turns')}"
+                  + (f" tools={state['tools']}" if state["tools"] else ""))
+
+    async def _pump_json(stream, sink):
+        # stdout is ndjson events (claude-code-style stream-json). Parse each
+        # complete line: pretty-tee to the pane, extract the final result, and
+        # surface live reasoning/tool status to Telegram (Zach 2026-09-01: no
+        # more silent runs — see what it's thinking while it thinks).
+        buf = ""
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            sink.append(chunk)
+            state["last"] = loop.time()
+            buf += chunk.decode(errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    try:
+                        await _handle_event(json.loads(line))
+                        continue
+                    except Exception:
+                        pass  # not valid JSON after all — fall through as raw
+                _pane(f"[raw] {line[:180]}")
+
+    async def _pump_raw(stream, sink):
+        # stderr: raw tee only
         while True:
             chunk = await stream.read(65536)
             if not chunk:
@@ -219,7 +301,7 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
             except Exception:
                 pass  # tee is best-effort; a display glitch must never kill the pump
 
-    pumps = asyncio.gather(_pump(proc.stdout, out_chunks), _pump(proc.stderr, err_chunks))
+    pumps = asyncio.gather(_pump_json(proc.stdout, out_chunks), _pump_raw(proc.stderr, err_chunks))
     start = loop.time()
     next_beat = start + HEARTBEAT if (HEARTBEAT and notify) else None
     reason = None
@@ -261,7 +343,10 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
             pass
         if CURRENT.get("proc") is proc:
             CURRENT["proc"] = None
-    out = b"".join(out_chunks).decode(errors="replace").strip()
+    # stream-json: the result event carries the final reply; fall back to the
+    # accumulated text blocks, then raw stdout (old -o text behaviour).
+    out = (state["result"] or "\n".join(state["texts"]).strip()
+           or b"".join(out_chunks).decode(errors="replace").strip())
     err = b"".join(err_chunks).decode(errors="replace")
     print(f"\n=== run end rc={proc.returncode} out={len(out)}B err={len(err)}B ===", flush=True)
     # If the group was killed externally (/stop) the loop exits with reason=None
@@ -273,19 +358,19 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
     return out, err
 
 
-async def run_qwen(prompt: str, notify=None) -> str:
+async def run_qwen(prompt: str, notify=None, progress=None) -> str:
     # Continue the running session for continuous context; on cold start (no
     # session yet) -c can fail, so fall back to a fresh run that seeds one.
-    text, err = await _run(prompt, cont=True, notify=notify)
+    text, err = await _run(prompt, cont=True, notify=notify, progress=progress)
     if not text and "No " in err and "session" in err.lower():
-        text, err = await _run(prompt, cont=False, notify=notify)
+        text, err = await _run(prompt, cont=False, notify=notify, progress=progress)
     if text:
         return text[-3800:]
     errtail = "\n".join(l for l in err.splitlines() if "Legacy setting" not in l).strip()
     return errtail[-3800:] if errtail else "(no output)"
 
 
-async def run_qwen_verified(prompt: str, notify=None) -> str:
+async def run_qwen_verified(prompt: str, notify=None, progress=None) -> str:
     """run_qwen, then smoke-test what it produced and loop it back to fix real failures.
 
     Only acts when the run actually changed code files (a chat/question is a no-op). Reports
@@ -293,9 +378,9 @@ async def run_qwen_verified(prompt: str, notify=None) -> str:
     harness never blocks a reply — see verify.py. Bounded by MAX_FIX_ROUNDS.
     """
     if not VERIFY_ON:
-        return await run_qwen(prompt, notify=notify)
+        return await run_qwen(prompt, notify=notify, progress=progress)
     before = await asyncio.to_thread(_verify.snapshot, WORKDIR)
-    reply = await run_qwen(prompt, notify=notify)
+    reply = await run_qwen(prompt, notify=notify, progress=progress)
     attempt = 0
     while True:
         after = await asyncio.to_thread(_verify.snapshot, WORKDIR)
@@ -318,6 +403,7 @@ async def run_qwen_verified(prompt: str, notify=None) -> str:
             f"{res.fix_hint}\n\n"
             "Fix it in place in the working directory, then stop. Reply only once it works.",
             notify=notify,
+            progress=progress,
         )
 
 
@@ -361,9 +447,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async def _notify(msg: str):
         await ctx.bot.send_message(chat_id=chat_id, text=msg)
 
+    # Live status bubble: created lazily on the first progress event, edited in
+    # place (throttled inside _run), deleted once the final reply is imminent.
+    prog = {"msg": None}
+
+    async def _progress(text: str):
+        try:
+            if prog["msg"] is None:
+                prog["msg"] = await ctx.bot.send_message(chat_id=chat_id, text=f"⚙️ {text}")
+            else:
+                await prog["msg"].edit_text(f"⚙️ {text}")
+        except Exception:
+            pass  # progress is cosmetic — never let it break the run
+
     async with _BUSY:
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
-        reply = await run_qwen_verified(prompt, notify=_notify)
+        reply = await run_qwen_verified(prompt, notify=_notify, progress=_progress)
 
         # Judgment gate: one bounded revision pass before the user sees anything.
         # Deliberately ONE pass, not a loop — the gate has a ~10% false-positive
@@ -383,6 +482,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             if revised and revised.strip() and revised != "(no output)":
                 reply = revised
+    if prog["msg"] is not None:  # final answer imminent — pop the status bubble
+        try:
+            await prog["msg"].delete()
+        except Exception:
+            pass
     # Auto-attach images: when qwen's reply cites absolute image paths that
     # exist on disk (e.g. something it just generated), send them as photos —
     # a path string is useless on a phone (Zach 2026-07-24: "why can't the

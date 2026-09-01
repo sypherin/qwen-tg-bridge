@@ -77,7 +77,7 @@ def test_fix_loop_flow():
     bridge.MAX_FIX_ROUNDS = 2
     state = {"n": 0}
 
-    async def fake_run(prompt, notify=None):
+    async def fake_run(prompt, notify=None, progress=None):
         state["n"] += 1
         if state["n"] == 1:
             (d / "main.py").write_text("raise RuntimeError('first attempt broken')\n")
@@ -107,7 +107,7 @@ def test_fix_loop_gives_up_after_cap():
     bridge.MAX_FIX_ROUNDS = 2
     runs = {"n": 0}
 
-    async def always_broken(prompt, notify=None):
+    async def always_broken(prompt, notify=None, progress=None):
         runs["n"] += 1
         (d / "main.py").write_text("raise RuntimeError('still broken')\n")
         return "attempt"
