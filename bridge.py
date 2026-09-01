@@ -478,9 +478,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Live status bubble: created lazily on the first progress event, edited in
     # place (throttled inside _run), deleted once the final reply is imminent.
-    prog = {"msg": None}
+    prog = {"msg": None, "done": False}
 
     async def _progress(text: str):
+        if prog["done"]:
+            return  # run finished — a late tick must never revive the bubble
         try:
             if prog["msg"] is None:
                 prog["msg"] = await ctx.bot.send_message(chat_id=chat_id, text=f"⚙️ {text}")
@@ -498,6 +500,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         reply = await run_qwen_verified(prompt, notify=_notify, progress=_progress)
+        if not (reply or "").strip() or reply.strip() == "(no output)":
+            reply = "(model returned no text — pls send again, or /new if the session is long)"
 
         # Judgment gate: one bounded revision pass before the user sees anything.
         # Deliberately ONE pass, not a loop — the gate has a ~10% false-positive
@@ -517,11 +521,25 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             if revised and revised.strip() and revised != "(no output)":
                 reply = revised
+    prog["done"] = True  # freeze the updater BEFORE deleting (late-tick race)
     if prog["msg"] is not None:  # final answer imminent — pop the status bubble
-        try:
-            await prog["msg"].delete()
-        except Exception:
-            pass
+        # Zach 2026-09-01: a flood-controlled delete left the bubble standing
+        # with its last thinking snippet as the visible "reply". Retry once,
+        # then blank the bubble so stale reasoning is never the final artifact.
+        deleted = False
+        for _ in range(2):
+            try:
+                await prog["msg"].delete()
+                deleted = True
+                break
+            except Exception:
+                await asyncio.sleep(1.5)
+        if not deleted:
+            try:
+                await prog["msg"].edit_text("✅ done")
+            except Exception:
+                pass
+        prog["msg"] = None
     # Auto-attach images: when qwen's reply cites absolute image paths that
     # exist on disk (e.g. something it just generated), send them as photos —
     # a path string is useless on a phone (Zach 2026-07-24: "why can't the
