@@ -393,9 +393,15 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
             pass
         if CURRENT.get("proc") is proc:
             CURRENT["proc"] = None
-    # stream-json: the result event carries the final reply; fall back to the
-    # accumulated text blocks, then raw stdout (old -o text behaviour).
-    out = (state["result"] or "\n".join(state["texts"]).strip()
+    # stream-json reply priority (fixed 2026-09-02): a run can emit MULTIPLE
+    # text blocks (the model occasionally appends a stray ack after its real
+    # answer — seen live: a placeholder tool result arrived late and the model
+    # tacked on "(also — ignore that)"). Taking result-first delivered ONLY
+    # that trailing ack and dropped the real answer. Text blocks are the
+    # user-visible reply in stream-json semantics, so join ALL of them and
+    # only fall back to the result event / raw stdout when none streamed.
+    texts = "\n".join(state["texts"]).strip()
+    out = (texts or state["result"]
            or b"".join(out_chunks).decode(errors="replace").strip())
     err = b"".join(err_chunks).decode(errors="replace")
     print(f"\n=== run end rc={proc.returncode} out={len(out)}B err={len(err)}B ===", flush=True)
