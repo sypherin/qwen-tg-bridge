@@ -114,6 +114,11 @@ CURRENT: dict = {"proc": None}
 MODEL_THINK = os.environ.get("QWEN_TG_MODEL_THINK", "qwen3.8-27b-think")
 MODEL_PLAIN = os.environ.get("QWEN_TG_MODEL_PLAIN", MODEL)
 THINK_FILE = Path.home() / "qwen-tg-bridge" / "think_mode"
+# Fast lane (2026-09-01, Zach: ":8022 for complex, :8001 for simple"). /fast
+# routes runs to the :8001 MoE (qwen3.6-35b provider id in ~/.qwen/settings.json)
+# and overrides /think while on — :8001 runs with reasoning off server-side.
+MODEL_FAST = os.environ.get("QWEN_TG_MODEL_FAST", "qwen3.6-35b")
+FAST_FILE = Path.home() / "qwen-tg-bridge" / "fast_mode"
 
 def _think_on() -> bool:
     try:
@@ -123,6 +128,15 @@ def _think_on() -> bool:
 
 def _set_think(on: bool) -> None:
     THINK_FILE.write_text("on" if on else "off")
+
+def _fast_on() -> bool:
+    try:
+        return FAST_FILE.read_text().strip().lower() == "on"
+    except Exception:
+        return False   # default off (:8022, the stronger model)
+
+def _set_fast(on: bool) -> None:
+    FAST_FILE.write_text("on" if on else "off")
 
 # Run-and-fix loop: after a coding run, smoke-test what was produced (execute it / render it
 # headless) and loop the model back on real failures — catches runtime bugs that parse clean
@@ -177,7 +191,7 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
     # Acceptable because the chat allowlist is Zach only.
     # Reasoning on/off = which provider id we select (both point at :8022; the
     # -think one carries extra_body.chat_template_kwargs.enable_thinking).
-    model = MODEL_THINK if _think_on() else MODEL_PLAIN
+    model = MODEL_FAST if _fast_on() else (MODEL_THINK if _think_on() else MODEL_PLAIN)
     # -o stream-json (2026-09-01): emits claude-code-style ndjson events on
     # stdout — assistant content blocks (thinking / text / tool_use) plus a
     # final {type:"result"} carrying the reply. We parse them live so the
@@ -566,6 +580,28 @@ async def on_think(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def on_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/fast [on|off] — route runs to the :8001 MoE for simple tasks (overrides /think)."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED:
+        return
+    arg = ""
+    if update.message and update.message.text:
+        parts = update.message.text.split()
+        arg = parts[1].lower() if len(parts) > 1 else ""
+    if arg in ("on", "off"):
+        _set_fast(arg == "on")
+        await update.message.reply_text(
+            "⚡ fast lane ON: runs go to qwen3.6-35b on :8001 (overrides /think)"
+            if arg == "on" else
+            "fast lane OFF: runs back on qwen3.8-27b at :8022"
+        )
+    else:
+        await update.message.reply_text(
+            f"fast lane is currently {'ON' if _fast_on() else 'OFF'}. use /fast on or /fast off."
+        )
+
+
 def main():
     if not ALLOWED:
         raise SystemExit("Refusing to start: QWEN_TG_ALLOWED_CHATS is empty (would accept anyone).")
@@ -576,6 +612,7 @@ def main():
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("stop", on_stop))
     app.add_handler(CommandHandler("think", on_think))
+    app.add_handler(CommandHandler("fast", on_fast))
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, on_message))
     print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} "
           f"idle_timeout={IDLE_TIMEOUT}s max_timeout={MAX_TIMEOUT}s workdir={WORKDIR}")
