@@ -6,7 +6,7 @@ ENV=~/.env.qwen-tg-bridge
 set -a; source "$ENV"; set +a
 
 if [ -z "${QWEN_TG_ALLOWED_CHATS:-}" ]; then
-  echo "No allowlist yet — reading your chat_id from a message you sent @zawdeq_bot..."
+  echo "No allowlist yet — reading your chat_id from the bot's recent messages (send your bot a DM first)..."
   CHAT=$(python3 -c "
 import urllib.request,json,os
 t=os.environ['TG_QWEN_BOT_TOKEN']

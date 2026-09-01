@@ -2,3 +2,8 @@ work/
 __pycache__/
 *.log
 .env*
+.pytest_cache/
+think_mode
+fast_mode
+fresh_next
+*.bak*
