@@ -25,6 +25,7 @@ import re
 import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -140,6 +141,32 @@ THINK_FILE = Path.home() / "qwen-tg-bridge" / "think_mode"
 # and overrides /think while on — :8001 runs with reasoning off server-side.
 MODEL_FAST = os.environ.get("QWEN_TG_MODEL_FAST", "qwen3.6-35b")
 FAST_FILE = Path.home() / "qwen-tg-bridge" / "fast_mode"
+# /new (2026-09-02): arm a one-shot flag; the next USER-initiated run skips -c
+# so a brand-new session seeds instead of resuming the long one. Flag file, not
+# state mutation, so it survives restarts and needs no lock.
+FRESH_FILE = Path.home() / "qwen-tg-bridge" / "fresh_next"
+# Replies the bridge itself substitutes carry no judgeable claim — running the
+# gate on them wastes a call and can spawn a pointless revision run.
+PLACEHOLDERS = {
+    "(no output)",
+    "(model returned no text — pls send again, or /new if the session is long)",
+}
+# Stale-update drop (2026-09-02, borrowed from terranc/claude-telegram-bot-bridge
+# design): after a bridge restart, PTB replays everything Telegram queued while
+# the bot was down — an old "fix that" firing a surprise run an hour later is
+# worse than dropping it. 0 disables.
+STALE_AFTER = int(os.environ.get("QWEN_TG_STALE_AFTER", "1200"))
+
+
+def _take_fresh() -> bool:
+    """True once if /new armed a fresh-session run; consumes the flag."""
+    if FRESH_FILE.exists():
+        try:
+            FRESH_FILE.unlink()
+        except Exception:
+            pass
+        return True
+    return False
 
 def _think_on() -> bool:
     try:
@@ -170,6 +197,15 @@ VERIFY_ON = os.environ.get("QWEN_TG_VERIFY", "1") != "0" and _verify is not None
 MAX_FIX_ROUNDS = int(os.environ.get("QWEN_TG_MAX_FIX_ROUNDS", "2"))
 
 WORKDIR.mkdir(parents=True, exist_ok=True)
+
+
+def _pane_log(line: str) -> None:
+    """Module-level pane/log line (the run-scoped `_pane` lives inside _run)."""
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 async def _kill_group(proc) -> None:
@@ -280,6 +316,11 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
                     if tx:
                         state["texts"].append(tx)
                         _pane(f"[text] {tx[:180]}")
+                        # progressive streaming (2026-09-02, after terranc's
+                        # bridge): show the answer forming in the bubble too,
+                        # not only thinking tails — matches how the final reply
+                        # is assembled from these very blocks.
+                        await _progress_tick("💬", tx[-140:])
                 elif bt == "tool_use":
                     state["tools"] += 1
                     name = b.get("name", "?")
@@ -414,11 +455,18 @@ async def _run(prompt: str, cont: bool, notify=None, progress=None) -> tuple[str
     return out, err
 
 
-async def run_qwen(prompt: str, notify=None, progress=None) -> str:
+async def run_qwen(prompt: str, notify=None, progress=None, fresh: bool = False) -> str:
     # Continue the running session for continuous context; on cold start (no
     # session yet) -c can fail, so fall back to a fresh run that seeds one.
-    text, err = await _run(prompt, cont=True, notify=notify, progress=progress)
-    if not text and "No " in err and "session" in err.lower():
+    # fresh=True (user sent /new) skips -c once so a clean session seeds.
+    # Only USER-initiated runs may consume the flag — the verify-fix loop and
+    # the judge revision NEED the session context they are about to act on.
+    cont = not (fresh and _take_fresh())
+    text, err = await _run(prompt, cont=cont, notify=notify, progress=progress)
+    # Loosened 2026-09-02: was `"No " in err` — exact-case; a lowercase
+    # "no session to continue" slipped through and surfaced raw stderr instead
+    # of retrying fresh. Only meaningful when we actually asked to resume.
+    if not text and cont and "no " in err.lower() and "session" in err.lower():
         text, err = await _run(prompt, cont=False, notify=notify, progress=progress)
     if text:
         return text[-3800:]
@@ -426,7 +474,7 @@ async def run_qwen(prompt: str, notify=None, progress=None) -> str:
     return errtail[-3800:] if errtail else "(no output)"
 
 
-async def run_qwen_verified(prompt: str, notify=None, progress=None) -> str:
+async def run_qwen_verified(prompt: str, notify=None, progress=None, fresh: bool = False) -> str:
     """run_qwen, then smoke-test what it produced and loop it back to fix real failures.
 
     Only acts when the run actually changed code files (a chat/question is a no-op). Reports
@@ -434,9 +482,9 @@ async def run_qwen_verified(prompt: str, notify=None, progress=None) -> str:
     harness never blocks a reply — see verify.py. Bounded by MAX_FIX_ROUNDS.
     """
     if not VERIFY_ON:
-        return await run_qwen(prompt, notify=notify, progress=progress)
+        return await run_qwen(prompt, notify=notify, progress=progress, fresh=fresh)
     before = await asyncio.to_thread(_verify.snapshot, WORKDIR)
-    reply = await run_qwen(prompt, notify=notify, progress=progress)
+    reply = await run_qwen(prompt, notify=notify, progress=progress, fresh=fresh)
     attempt = 0
     while True:
         after = await asyncio.to_thread(_verify.snapshot, WORKDIR)
@@ -467,6 +515,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in ALLOWED:
         return  # silent: do not engage non-allowlisted chats
+    # Stale replay guard (2026-09-02): after downtime/restart PTB drains
+    # everything Telegram queued — a prompt from an hour ago firing a surprise
+    # run (and clobbering /new state) is worse than dropping it.
+    if update.message is None:
+        return  # edited_message/channel_post — update.message would crash below
+    if STALE_AFTER and (datetime.now(timezone.utc) - update.message.date).total_seconds() > STALE_AFTER:
+        _pane_log(f"[drop] stale message {update.message.message_id} sent {update.message.date:%Y-%m-%d %H:%M} UTC — not replaying")
+        return
     prompt = (update.message.text or update.message.caption or "").strip()
     # Photos: qwen's brain (:8001) is text-only, so hand the agent a file path
     # plus the `see` CLI (Qwen3.8-27B VL on :8022) as its eyes. Largest size wins.
@@ -557,7 +613,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             prog["msg"] = await ctx.bot.send_message(chat_id=chat_id, text="⚙️ qwen starting…")
         except Exception:
             pass
-        reply = await run_qwen_verified(prompt, notify=_notify, progress=_progress)
+        reply = await run_qwen_verified(prompt, notify=_notify, progress=_progress, fresh=True)
         if not (reply or "").strip() or reply.strip() == "(no output)":
             reply = "(model returned no text — pls send again, or /new if the session is long)"
 
@@ -567,7 +623,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # while the user waits. If the revision is empty or the gate is unhappy
         # again, the original reply goes out regardless. The gate improves replies;
         # it never withholds them.
-        verdict = await asyncio.to_thread(judge_verdict, reply, chat_id)
+        verdict = (None if reply.strip() in PLACEHOLDERS
+                   else await asyncio.to_thread(judge_verdict, reply, chat_id))
         if verdict:
             await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
             revised = await run_qwen(
@@ -678,6 +735,40 @@ async def on_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def on_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/new — the next message starts a FRESH session (old context dropped).
+
+    The no-output hint has told Zach to send /new for weeks; the command never
+    existed (commands are excluded by ~filters.COMMAND, so it was silently
+    ignored). Arms a one-shot flag consumed by the next user-initiated run —
+    fix-loop/revision runs never consume it, they need the current session.
+    """
+    chat_id = update.effective_chat.id
+    if chat_id not in ALLOWED:
+        return
+    FRESH_FILE.write_text("on")
+    await update.message.reply_text("🆕 fresh session armed — your next message starts clean (old context dropped).")
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Surface handler exceptions instead of swallowing them into PTB's logger
+    (no error handler was registered — a bridge that fails silently is
+    indistinguishable from one that ignores you). Traceback always goes to the
+    tmux pane; allowlisted chats additionally get a one-liner."""
+    import traceback
+    tb = "".join(traceback.format_exception(None, ctx.error, ctx.error.__traceback__))
+    _pane_log(f"\n=== handler error ===\n{tb}")
+    try:
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None and chat.id in ALLOWED:
+            await ctx.bot.send_message(
+                chat_id=chat.id,
+                text=f"⚠️ bridge error: {type(ctx.error).__name__}: {str(ctx.error)[:180]} — check tmux qwentg",
+            )
+    except Exception:
+        pass
+
+
 def main():
     if not ALLOWED:
         raise SystemExit("Refusing to start: QWEN_TG_ALLOWED_CHATS is empty (would accept anyone).")
@@ -689,7 +780,14 @@ def main():
     app.add_handler(CommandHandler("stop", on_stop))
     app.add_handler(CommandHandler("think", on_think))
     app.add_handler(CommandHandler("fast", on_fast))
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, on_message))
+    app.add_handler(CommandHandler("new", on_new))
+    app.add_error_handler(on_error)
+    # filters.UpdateType.MESSAGE (fixed 2026-09-02): without it MessageHandler
+    # ALSO fires for edited_message updates, where update.message is None ->
+    # AttributeError at the .text read (and an edit would re-run the prompt).
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO)
+        & ~filters.COMMAND & filters.UpdateType.MESSAGE, on_message))
     print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} "
           f"idle_timeout={IDLE_TIMEOUT}s max_timeout={MAX_TIMEOUT}s workdir={WORKDIR}")
     app.run_polling()
