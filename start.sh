@@ -15,7 +15,7 @@ ids=[ (m.get('message') or m.get('edited_message') or {}).get('chat',{}).get('id
 ids=[str(i) for i in ids if i]
 print(ids[-1] if ids else '')
 ")
-  if [ -z "$CHAT" ]; then echo "  -> No message found. Send @zawdeq_bot a message first, then re-run."; exit 1; fi
+  if [ -z "$CHAT" ]; then echo "  -> No message found. Send your bot a DM first, then re-run."; exit 1; fi
   echo "QWEN_TG_ALLOWED_CHATS=$CHAT" >> "$ENV"
   export QWEN_TG_ALLOWED_CHATS="$CHAT"
   echo "  -> allowlisted chat_id $CHAT"
