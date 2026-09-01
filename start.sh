@@ -21,7 +21,12 @@ print(ids[-1] if ids else '')
   echo "  -> allowlisted chat_id $CHAT"
 fi
 
-export OPENAI_BASE_URL=http://127.0.0.1:8001/v1
+# 2026-09-01: synced with the systemd unit values — the bridge brain is the
+# :8022 llama-server (Qwen3.8-27B), not the old :8001/qwen3.6. Also export PATH
+# so the `qwen` CLI (~/.npm-global/bin) is reachable when spawned from tmux,
+# whose server env does not inherit the login shell's PATH.
+export PATH="$HOME/.npm-global/bin:$PATH"
+export OPENAI_BASE_URL=http://127.0.0.1:8022/v1
 export OPENAI_API_KEY=sk-local
-export OPENAI_MODEL=qwen3.6-35b-a3b
+export OPENAI_MODEL=qwen3.8-27b
 exec python3 ~/qwen-tg-bridge/bridge.py

@@ -23,7 +23,9 @@ import os
 import re
 import signal
 import subprocess
+import sys
 from pathlib import Path
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
@@ -194,17 +196,28 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
     state = {"last": loop.time()}
+    print(f"\n=== run start{' (cont)' if cont else ''} | model={model} ===", flush=True)
+    print(f"prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}", flush=True)
 
     async def _pump(stream, sink):
         # Stream incrementally instead of communicate() (which only returns at
         # exit) so we can tell a working run from a hung one by WHEN output last
         # arrived. Every chunk resets the idle clock.
+        # Each chunk is ALSO tee'd to our own stdout, so `tmux attach -t qwentg`
+        # shows live what qwen is doing (tool calls / progress / the reply as it
+        # streams) instead of a silent pane — the run is otherwise invisible
+        # until the final answer lands in Telegram (Zach 2026-09-01).
         while True:
             chunk = await stream.read(65536)
             if not chunk:
                 break
             sink.append(chunk)
             state["last"] = loop.time()
+            try:
+                sys.stdout.write(chunk.decode(errors="replace"))
+                sys.stdout.flush()
+            except Exception:
+                pass  # tee is best-effort; a display glitch must never kill the pump
 
     pumps = asyncio.gather(_pump(proc.stdout, out_chunks), _pump(proc.stderr, err_chunks))
     start = loop.time()
@@ -250,6 +263,7 @@ async def _run(prompt: str, cont: bool, notify=None) -> tuple[str, str]:
             CURRENT["proc"] = None
     out = b"".join(out_chunks).decode(errors="replace").strip()
     err = b"".join(err_chunks).decode(errors="replace")
+    print(f"\n=== run end rc={proc.returncode} out={len(out)}B err={len(err)}B ===", flush=True)
     # If the group was killed externally (/stop) the loop exits with reason=None
     # but a non-zero/deadly returncode; surface partial output either way.
     if reason:
