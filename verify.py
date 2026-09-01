@@ -38,7 +38,7 @@ from pathlib import Path
 CODE_EXTS = {".py", ".js", ".mjs", ".cjs", ".html", ".htm"}
 ALL_EXTS = CODE_EXTS | {".ts", ".css", ".json"}
 SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", "dist", ".next"}
-SKIP_NAME = re.compile(r"^\.|^_run\.log$|^tg-photo-|\.imgfile$|^index_dbg\.html$")
+SKIP_NAME = re.compile(r"^\.|^_run\.log$|^tg-photo-|^tg-voice-|\.imgfile$|^index_dbg\.html$")
 
 # A python file that opens a listener would hang if executed, so only syntax-check these.
 _SERVER_HINT = re.compile(

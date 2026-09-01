@@ -39,6 +39,27 @@ JUDGE_MAX_CHARS = 6000
 
 JUDGE_TIMEOUT = 45
 
+# Voice notes (2026-09-01): transcribe locally with faster-whisper via hear.py
+# (sits beside this file, mirrors ~/bin/see). CPU int8 "small" — a 60s note
+# takes ~5-10s; cold model load ~2s. Timeout is generous because the Strix box
+# may be busy with a qwen run on the same CPU.
+HEAR = Path(__file__).resolve().parent / "hear.py"
+HEAR_TIMEOUT = int(os.environ.get("QWEN_TG_HEAR_TIMEOUT", "180"))
+
+
+def _transcribe(path: Path) -> str:
+    """Voice note -> text. Raises on failure; empty string = nothing intelligible."""
+    try:
+        p = subprocess.run(
+            ["python3", str(HEAR), str(path)],
+            capture_output=True, text=True, timeout=HEAR_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"transcription timed out after {HEAR_TIMEOUT}s")
+    if p.returncode == 0:
+        return (p.stdout or "").strip()
+    raise RuntimeError((p.stderr or f"exit {p.returncode}").strip()[-300:])
+
 
 def judge_verdict(reply: str, chat_id: int) -> Optional[str]:
     """Judge a draft reply BEFORE it is sent. Returns the verdict text if the
@@ -464,6 +485,37 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:  # noqa: BLE001 — never drop a message silently
             prompt = f"(The user sent an image but downloading it failed: {e}. Tell them to resend.)"
+    # Voice/audio notes: transcribe with hear.py and treat the transcript as
+    # the prompt. The transcript is echoed back BEFORE the run so a mishear is
+    # visible immediately (Zach's observability rule), not after a 1-4 min
+    # qwen run built on garbage input.
+    va = update.message.voice or update.message.audio
+    if va is not None:
+        cap = prompt  # audio can carry a caption; voice notes cannot
+        try:
+            tgf = await va.get_file()
+            aud_path = WORKDIR / f"tg-voice-{update.message.message_id}.ogg"
+            await tgf.download_to_drive(str(aud_path))
+            await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+            try:
+                transcript = await asyncio.to_thread(_transcribe, aud_path)
+            except Exception as e:  # noqa: BLE001 — never drop a message silently
+                prompt = f"(The user sent a voice message but transcribing it failed: {e}. Tell them to resend as text.)"
+            else:
+                if not transcript:
+                    prompt = ("(The user sent a voice message but the transcript came back empty — "
+                              "no intelligible speech. Tell them briefly and suggest typing it.)")
+                else:
+                    try:
+                        await update.message.reply_text(f"🎙 {transcript[:800]}")
+                    except Exception:
+                        pass  # echo is cosmetic; the run must proceed either way
+                    prompt = ("The user sent a voice message; this is its transcript:\n"
+                              f"\"\"\"\n{transcript}\n\"\"\"\n"
+                              "Treat the transcript as the user's message and reply to it directly."
+                              + (f"\n\n(They also added this caption: {cap})" if cap else ""))
+        except Exception as e:  # noqa: BLE001 — download failure — never drop silently
+            prompt = f"(The user sent a voice message but downloading it failed: {e}. Tell them to resend.)"
     if not prompt:
         return
     # One run at a time — a second prompt while a run is in flight would start a
@@ -631,7 +683,7 @@ def main():
     app.add_handler(CommandHandler("stop", on_stop))
     app.add_handler(CommandHandler("think", on_think))
     app.add_handler(CommandHandler("fast", on_fast))
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO) & ~filters.COMMAND, on_message))
     print(f"qwen-tg-bridge up | model={MODEL} base={BASE_URL} allow={sorted(ALLOWED)} "
           f"idle_timeout={IDLE_TIMEOUT}s max_timeout={MAX_TIMEOUT}s workdir={WORKDIR}")
     app.run_polling()
